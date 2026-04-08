@@ -1,0 +1,21 @@
+# litellm-config.yaml
+# LiteLLM proxy configuration — routes OpenAI-compatible requests to vLLM.
+#
+# This file is loaded as a ConfigMap. Do NOT apply it directly with kubectl apply.
+# Run:  source ../config.env && envsubst < litellm-config.yaml > litellm-config-rendered.yaml
+# Then: kubectl create configmap litellm-config --from-file=config.yaml=litellm-config-rendered.yaml -n $MY_NAMESPACE
+#
+# OR let scripts/deploy-all.sh handle it automatically.
+model_list:
+  - model_name: llama-3.3-70b-instruct
+    litellm_params:
+      model: openai/llama-3.3-70b-instruct
+      api_base: http://vllm-llama-70b.${MY_NAMESPACE}.svc.cluster.local:8000/v1
+      api_key: "not-used"
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 300
+
+general_settings:
+  master_key: "${LITELLM_MASTER_KEY}"

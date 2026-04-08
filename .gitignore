@@ -1,0 +1,17 @@
+# Local config — never commit real credentials
+config.env
+
+# Rendered/temp YAML files
+*-rendered.yaml
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

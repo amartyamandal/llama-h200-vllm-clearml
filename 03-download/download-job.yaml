@@ -1,0 +1,58 @@
+# download-job.yaml
+# Kubernetes Job that downloads Llama 3.3 70B weights (~140 GB) from Hugging Face
+# into the PVC created in step 02.
+#
+# huggingface_hub resumes interrupted downloads automatically — safe to re-run.
+#
+# To apply manually: source ../config.env && envsubst < download-job.yaml | kubectl apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: llama-download
+  namespace: ${MY_NAMESPACE}
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      # Uncomment for air-gapped clusters that require an image pull secret:
+      # imagePullSecrets:
+      #   - name: ${MY_IMAGE_PULL_SECRET}
+      containers:
+        - name: downloader
+          image: ${MY_PYTHON_IMAGE}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install -q huggingface_hub && \
+              python3 -c "
+              from huggingface_hub import snapshot_download
+              import os
+              print('Starting download to /models/llama-3.3-70b')
+              print('This will download ~140 GB. Be patient.')
+              snapshot_download(
+                  repo_id='meta-llama/Llama-3.3-70B-Instruct',
+                  local_dir='/models/llama-3.3-70b',
+                  token=os.environ['HF_TOKEN'],
+                  ignore_patterns=['*.gguf', '*.bin'],
+              )
+              print('Download complete')
+              "
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: token
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: llama-model-storage

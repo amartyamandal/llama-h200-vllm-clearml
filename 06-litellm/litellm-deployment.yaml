@@ -1,0 +1,69 @@
+# litellm-deployment.yaml
+# Deploys LiteLLM proxy in front of vLLM, providing:
+#   - OpenAI-compatible /v1/chat/completions endpoint
+#   - API key authentication
+#   - Usage logging
+#
+# Service type is NodePort by default.
+# Change to LoadBalancer if your cluster supports it.
+#
+# To apply manually: source ../config.env && envsubst < litellm-deployment.yaml | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-proxy
+  namespace: ${MY_NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: litellm-proxy
+  template:
+    metadata:
+      labels:
+        app: litellm-proxy
+    spec:
+      # Uncomment for air-gapped clusters that require an image pull secret:
+      # imagePullSecrets:
+      #   - name: ${MY_IMAGE_PULL_SECRET}
+      containers:
+        - name: litellm
+          image: ${MY_LITELLM_IMAGE}
+          args:
+            - --config=/app/config.yaml
+            - --port=4000
+          ports:
+            - containerPort: 4000
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "1"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm-proxy
+  namespace: ${MY_NAMESPACE}
+spec:
+  selector:
+    app: litellm-proxy
+  ports:
+    - port: 4000
+      targetPort: 4000
+  type: NodePort
+  # Change to LoadBalancer if your cluster has a cloud load balancer:
+  # type: LoadBalancer

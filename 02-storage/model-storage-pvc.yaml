@@ -1,0 +1,16 @@
+# model-storage-pvc.yaml
+# Persistent volume for Llama 3.3 70B weights (~140 GB).
+# Values are substituted from config.env by deploy-all.sh (via envsubst).
+# To apply manually: source ../config.env && envsubst < model-storage-pvc.yaml | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llama-model-storage
+  namespace: ${MY_NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 300Gi
+  storageClassName: ${MY_STORAGE_CLASS}

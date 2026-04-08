@@ -1,0 +1,112 @@
+# vllm-deployment.yaml
+# Deploys vLLM OpenAI-compatible inference server for Llama 3.3 70B.
+#
+# Key settings driven by config.env:
+#   MY_NAMESPACE            — target namespace
+#   MY_TENSOR_PARALLEL_SIZE — number of GPUs (2 for H200, 4 for H100)
+#   MY_GPU_TAINT_KEY        — node taint key (often "nvidia.com/gpu")
+#   MY_VLLM_IMAGE           — full image path (public or internal registry)
+#   MY_IMAGE_PULL_SECRET    — pull secret name, or "none" for public clusters
+#
+# To apply manually: source ../config.env && envsubst < vllm-deployment.yaml | kubectl apply -f -
+#
+# Model load takes 3-5 minutes. Watch logs for:
+#   "INFO:     Application startup complete."
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-llama-70b
+  namespace: ${MY_NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-llama-70b
+  template:
+    metadata:
+      labels:
+        app: vllm-llama-70b
+    spec:
+      # Uncomment for air-gapped clusters that require an image pull secret:
+      # imagePullSecrets:
+      #   - name: ${MY_IMAGE_PULL_SECRET}
+      containers:
+        - name: vllm
+          image: ${MY_VLLM_IMAGE}
+          command:
+            - python3
+            - -m
+            - vllm.entrypoints.openai.api_server
+          args:
+            - --model=/models/llama-3.3-70b
+            - --served-model-name=llama-3.3-70b-instruct
+            - --tensor-parallel-size=${MY_TENSOR_PARALLEL_SIZE}
+            - --dtype=bfloat16
+            - --max-model-len=32768
+            - --gpu-memory-utilization=0.90
+            - --port=8000
+            - --host=0.0.0.0
+            - --trust-remote-code
+            - --enable-chunked-prefill
+          ports:
+            - containerPort: 8000
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-credentials
+                  key: token
+          resources:
+            limits:
+              nvidia.com/gpu: "${MY_TENSOR_PARALLEL_SIZE}"
+            requests:
+              nvidia.com/gpu: "${MY_TENSOR_PARALLEL_SIZE}"
+              memory: "64Gi"
+              cpu: "8"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 180
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: llama-model-storage
+        - name: shm
+          # /dev/shm is required for NCCL inter-GPU communication over NVLink
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
+      tolerations:
+        - key: ${MY_GPU_TAINT_KEY}
+          operator: Exists
+          effect: NoSchedule
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama-70b
+  namespace: ${MY_NAMESPACE}
+spec:
+  selector:
+    app: vllm-llama-70b
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP
