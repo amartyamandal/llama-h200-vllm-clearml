@@ -1,342 +1,310 @@
-# Deploying Llama 3.3 70B on H200 GPUs with vLLM + ClearML
+# Deploying a 70B LLM on Multi-GPU Kubernetes with vLLM + ClearML
 
-A step-by-step production deployment guide. Every step includes a **🔍 VERIFY BEFORE PROCEEDING** gate so you confirm your cluster's actual configuration before running anything.
-
-> **Your starting point:** ClusterAdmin access to a K8s cluster with H200 GPUs, ClearML already installed, and hands-on experience from the sovereign-lab (Phase 1/2/3 pipeline).
-
-> **What this guide produces:** Llama 3.3 70B running via vLLM on H200 GPUs, an OpenAI-compatible API behind a LiteLLM proxy, and the model tracked in ClearML — the production-scale version of your home lab.
+A step-by-step production deployment guide for air-gapped, multi-tenant Kubernetes
+clusters with GPU scheduling managed by ClearML Enterprise.
 
 ---
 
-## How this maps to what you already know
+## Cluster profile this guide is written for
 
-| Local lab | Production (this guide) |
-| --------- | ----------------------- |
-| TinyGPT ~500K params, pure PyTorch | Llama 3.3 70B, loaded by vLLM |
-| `serve.py` (stdlib HTTP server) | vLLM OpenAI server (production-grade) |
-| GTX 1070 Ti, 8 GB VRAM, float32 | H200, 141 GB HBM3e, bfloat16 |
-| Model registered in local ClearML | Model registered in cluster ClearML |
-| LiteLLM on port 4100 (Docker) | LiteLLM on cluster (Kubernetes Deployment) |
-| `phase3_inference/run.py` | This guide |
+| Property | Your cluster |
+|----------|-------------|
+| GPU type | H200 (141 GB HBM3e) or H100 (80 GB HBM3) |
+| Cluster access | ClusterAdmin on Kubernetes |
+| ClearML access | Tenant admin on ClearML Enterprise (multi-tenant) |
+| MIG status | Enabled on some nodes — must be avoided for full-GPU workloads |
+| Internet egress | **None** — pods cannot reach external sites |
+| Image pulling | Public registries (Docker Hub, NGC) via managed pull secrets |
+| Storage backend | Enterprise NFS (e.g. Powerscale/Isilon) |
+| ClearML queue | Not yet created — you will create it |
 
-The concepts are identical. The only differences are scale and the inference engine.
+If your cluster differs, adjust the marked parameters accordingly.
 
 ---
 
-## Step 0 — Discover YOUR cluster
+## Before you begin: what you need from the platform team
 
-Before touching anything, gather the facts about the cluster you're working on. Every value you collect here will be referenced in later steps.
+Even with ClusterAdmin and ClearML tenant admin, some things require
+platform team involvement. Ask these first and **do not proceed until
+you have answers:**
 
-### 0.1 — Confirm cluster access and your permissions
+### Must ask (you cannot solve these yourself)
+
+**1. Model weights ingestion path**
+
+> "Pods in this cluster cannot reach the internet. I need to stage ~140 GB
+> of LLM weights onto the NFS storage backend. What is the approved path
+> for getting large external files into the cluster? Is there a bastion
+> host, NFS mount point, S3 staging bucket, or a data transfer process?"
+
+**2. Model source / licensing**
+
+> "Does the organization have a Hugging Face account or token for
+> downloading gated models (e.g. Llama 3.3 70B)? Has anyone already
+> downloaded LLM weights that I can reuse from shared storage? If
+> Hugging Face is not approved, should I use an ungated model instead?"
+
+**3. Long-running workloads policy**
+
+> "An inference server (vLLM) needs to run 24/7 as an always-on service,
+> not a batch job that completes and exits. Should I deploy it through
+> ClearML queues, or as a standalone Kubernetes Deployment?"
+
+### Can verify yourself (do these while waiting for answers)
+
+Everything in Step 0 below.
+
+---
+
+## Step 0 — Discover your cluster
+
+Run every command below and fill in the values. These are referenced
+throughout the guide. **Do not skip this step.**
+
+### 0.1 — Confirm Kubernetes access
 
 ```bash
-# Can you reach the cluster?
 kubectl cluster-info
-
-# What nodes exist?
-kubectl get nodes -o wide
-
-# Do you actually have ClusterAdmin?
 kubectl auth can-i '*' '*' --all-namespaces
-# Expected: "yes"
-# If "no": STOP. You need ClusterAdmin before proceeding.
+# Must show: "yes"
+# If "no": STOP. Get ClusterAdmin before proceeding.
 ```
 
-### 0.2 — Discover GPU nodes and count
+### 0.2 — Discover GPU nodes
 
 ```bash
-# List nodes with GPU counts
 kubectl get nodes -o custom-columns=\
 "NAME:.metadata.name,\
 GPUs:.status.allocatable.nvidia\.com/gpu,\
-MEMORY:.status.allocatable.memory,\
-OS:.status.nodeInfo.osImage"
+MEMORY:.status.allocatable.memory"
 ```
 
-**🔍 VERIFY:** Write down your answers:
 ```
-MY_GPU_NODE_NAMES=          # e.g. "gpu-node-01, gpu-node-02"
-MY_GPU_COUNT_PER_NODE=      # e.g. "8"
-MY_TOTAL_GPUS_AVAILABLE=    # e.g. "16"
+MY_GPU_NODES=               # list node names with GPUs
+MY_GPUS_PER_NODE=           # e.g. "8"
 ```
 
-### 0.3 — Confirm these are actually H200s (not H100s)
+### 0.3 — Confirm GPU type and memory
 
 ```bash
-# SSH into a GPU node or exec into any pod on a GPU node and run:
-kubectl debug node/<YOUR_GPU_NODE_NAME> -it --image=nvidia/cuda:12.4.0-base-ubuntu22.04 -- nvidia-smi
-
-# Look for the GPU name and memory:
-# "NVIDIA H200" and "141 GB" (or ~143360 MiB)
-#
-# If you see "NVIDIA H100" and "80 GB" (or ~81920 MiB):
-#   You have H100s, not H200s. The guide still works but:
-#   - You need MINIMUM 2 GPUs (2×80 = 160 GB) just for weights
-#   - Recommended: 4 GPUs for usable KV cache
-#   - Change --tensor-parallel-size=4 in Step 5
+# Pick any GPU node from the list above
+kubectl debug node/<GPU_NODE_NAME> -it --image=nvidia/cuda:12.4.0-base-ubuntu22.04 -- nvidia-smi
 ```
 
-**🔍 VERIFY:** Write down:
+Look for the GPU name and memory in the output:
+- **"NVIDIA H200" + ~141 GB** → H200. Use `TENSOR_PARALLEL_SIZE=2` minimum.
+- **"NVIDIA H100" + ~80 GB** → H100. Use `TENSOR_PARALLEL_SIZE=4` minimum.
+
 ```
 MY_GPU_TYPE=                # "H200" or "H100"
-MY_GPU_MEMORY_GB=           # 141 (H200) or 80 (H100)
+MY_GPU_MEMORY_GB=           # 141 or 80
+MY_TENSOR_PARALLEL_SIZE=    # 2 (H200) or 4 (H100)
 ```
 
-**GPU count decision based on what you just found:**
-
-| GPU type | VRAM each | Minimum GPUs for Llama 70B bf16 | Recommended |
-|----------|-----------|--------------------------------|-------------|
-| H200 | 141 GB | 2 (282 GB total) | 4 |
-| H100 | 80 GB | 2 (160 GB — tight) | 4 |
-
-```
-MY_TENSOR_PARALLEL_SIZE=    # 2 for H200, 4 for H100 (or adjust based on available GPUs)
-```
-
-### 0.4 — Discover the ClearML namespace and services
+### 0.4 — Identify MIG nodes (must avoid)
 
 ```bash
-# Find where ClearML is running
-kubectl get pods --all-namespaces | grep -i clearml
-
-# Note the namespace
-kubectl get svc -n <CLEARML_NAMESPACE>
+# Check which nodes have MIG enabled
+for node in $(kubectl get nodes -o name | sed 's|node/||'); do
+  echo "--- $node ---"
+  kubectl debug node/$node -it --image=nvidia/cuda:12.4.0-base-ubuntu22.04 -- nvidia-smi mig -lgi 2>/dev/null || echo "No MIG"
+done
 ```
 
-**🔍 VERIFY:** Write down:
-```
-MY_CLEARML_NAMESPACE=       # e.g. "mlops-platform", "clearml", "default"
-MY_CLEARML_API_URL=         # e.g. "http://clearml-api:8008" or NodePort URL
-MY_CLEARML_WEB_URL=         # e.g. "http://clearml-web:8080"
-MY_CLEARML_FILES_URL=       # e.g. "http://clearml-files:8081"
-```
-
-Open `MY_CLEARML_WEB_URL` in your browser. Log in. Create API credentials:
-`Settings → Workspace → Create new credentials`
+Any node that shows MIG instances is a MIG node. Your workload needs **full GPUs**,
+not MIG slices. A 70B model in bfloat16 needs ~140 GB — no MIG profile is large enough.
 
 ```
-MY_CLEARML_ACCESS_KEY=      # from ClearML UI
-MY_CLEARML_SECRET_KEY=      # from ClearML UI
+MY_MIG_NODES=               # node names WITH MIG (avoid these)
+MY_FULL_GPU_NODES=          # node names WITHOUT MIG (target these)
 ```
 
-### 0.5 — Discover available storage classes
+### 0.5 — Confirm GPU availability on non-MIG nodes
 
 ```bash
-kubectl get storageclass
+# Check allocated vs allocatable GPUs on your target nodes
+for node in MY_FULL_GPU_NODES; do    # replace with actual node names
+  echo "--- $node ---"
+  kubectl describe node $node | grep -A5 "Allocated resources" | grep nvidia
+done
 ```
 
-**🔍 VERIFY:** Write down:
 ```
-MY_STORAGE_CLASS=           # e.g. "gp3", "standard", "local-path", "ceph-rbd"
+MY_FREE_GPUS=               # free GPUs on non-MIG nodes (must be >= TENSOR_PARALLEL_SIZE)
 ```
 
-If you're unsure which one to use, pick the one marked `(default)` in the output.
-If none is marked default, ask the cluster owner.
-
-### 0.6 — Check existing GPU usage
+### 0.6 — Check node labels and taints
 
 ```bash
-# Are any GPUs currently in use?
-kubectl get pods --all-namespaces -o wide | grep -i gpu
+# Check taints on GPU nodes (needed for tolerations in your pod specs)
+kubectl describe nodes | grep -A3 "Taints:"
 
-# Check GPU allocations per node
-kubectl describe nodes | grep -A10 "Allocated resources" | grep -A3 "nvidia"
+# Check existing labels (ClearML agent uses labels to target nodes)
+kubectl get nodes --show-labels | grep -i "gpu\|nvidia\|accelerator"
 ```
 
-**🔍 VERIFY:** Write down:
 ```
-MY_FREE_GPUS=               # e.g. "6 out of 8 available"
+MY_GPU_TAINT_KEY=           # e.g. "nvidia.com/gpu" or "gpu=true" or "none"
+MY_GPU_NODE_LABEL=          # e.g. "nvidia.com/gpu.product=NVIDIA-H200" or custom label
 ```
 
-If fewer GPUs are free than `MY_TENSOR_PARALLEL_SIZE`, you need to wait or coordinate with other users.
-
-### 0.7 — Check network egress (can the cluster pull images and download models?)
+If your non-MIG full-GPU nodes don't have a label that distinguishes them from
+MIG nodes, create one now:
 
 ```bash
-# Test: can a pod reach the internet?
-kubectl run test-egress --rm -it --restart=Never --image=busybox -- wget -qO- https://huggingface.co --timeout=10
-# If this hangs or fails: the cluster may be air-gapped.
-# You'll need to pre-load the vLLM image and model weights. See 0.7a and 0.7b below.
+# Label your full-GPU nodes (skip if a distinguishing label already exists)
+kubectl label node <FULL_GPU_NODE_NAME> gpu-mode=full
+# Repeat for each non-MIG GPU node
 ```
 
-**🔍 VERIFY:** Write down:
-```
-MY_CLUSTER_HAS_INTERNET=    # "yes" or "no"
-```
-
-### 0.7a — (If air-gapped / sandboxed) Discover the internal container registry
-
-Most corporate clusters pull images from an internal registry, not Docker Hub.
+### 0.7 — Discover ClearML tenant namespaces
 
 ```bash
-# Check if there's an existing pull secret that tells you the registry URL
-kubectl get secrets --all-namespaces | grep -i "registry\|pull\|docker"
+# Find namespaces with ClearML components
+kubectl get pods --all-namespaces | grep -i "clearml\|agent\|k8sglue\|app-gateway"
 
-# Check what registry existing pods use
+# List all ClearML-related services
+kubectl get svc --all-namespaces | grep -i clearml
+```
+
+```
+MY_CLEARML_NAMESPACES=      # namespaces where ClearML pods run
+MY_CLEARML_AGENT_NAMESPACE= # namespace where the agent for YOUR tenant runs (if any)
+```
+
+### 0.8 — Discover storage classes
+
+```bash
+kubectl get storageclass -o custom-columns="NAME:.metadata.name,PROVISIONER:.provisioner,DEFAULT:.metadata.annotations.storageclass\.kubernetes\.io/is-default-class"
+
+# Identify which class provisions on your NFS backend (Powerscale/Isilon)
+# Look for provisioner containing "powerscale", "isilon", "nfs", or "csi-isilon"
+```
+
+```
+MY_STORAGE_CLASS=           # storage class that provisions on NFS
+```
+
+### 0.9 — Discover image pull secrets
+
+```bash
+# Find managed pull secrets
+kubectl get secrets --all-namespaces | grep -i "pull\|registry\|docker\|image"
+
+# Check what images existing pods use (to confirm public registries work)
 kubectl get pods --all-namespaces -o jsonpath='{range .items[*]}{.spec.containers[*].image}{"\n"}{end}' | sort -u | head -20
-# Look for patterns like:
-#   artifactory.yourcompany.com/docker/nginx:latest
-#   registry.internal.corp/images/python:3.11
-#   123456789.dkr.ecr.us-east-1.amazonaws.com/app:v1
-# The domain before the first "/" is your internal registry
 ```
 
-**🔍 VERIFY:** Write down:
 ```
-MY_CONTAINER_REGISTRY=      # e.g. "artifactory.corp.com/docker" or "docker.io" if public
-MY_IMAGE_PULL_SECRET=       # e.g. "registry-credentials" or "none" if public
+MY_PULL_SECRET_NAME=        # e.g. "dockerhub-credentials" or "regcred"
+MY_PULL_SECRET_NAMESPACE=   # where the pull secret lives
 ```
 
-### 0.7b — (If air-gapped / sandboxed) Pre-load the vLLM image
-
-**This is important:** vLLM is NOT pre-installed on the cluster. It runs as a container image that Kubernetes pulls when you create the Deployment in Step 5. If the cluster can't reach Docker Hub, you need to get the image into the internal registry first.
+### 0.10 — Confirm ClearML tenant access
 
 ```bash
-# On a machine WITH internet access (your laptop, a bastion host, a CI runner):
-docker pull vllm/vllm-openai:latest
-docker pull ghcr.io/berriai/litellm:main-stable
-docker pull python:3.11-slim
+# From your local machine — configure ClearML CLI
+clearml-init
+# Enter your API server, web server, file server URLs and credentials
 
-# Tag them for your internal registry
-docker tag vllm/vllm-openai:latest $MY_CONTAINER_REGISTRY/vllm-openai:latest
-docker tag ghcr.io/berriai/litellm:main-stable $MY_CONTAINER_REGISTRY/litellm:main-stable
-docker tag python:3.11-slim $MY_CONTAINER_REGISTRY/python:3.11-slim
-
-# Push to internal registry
-docker push $MY_CONTAINER_REGISTRY/vllm-openai:latest
-docker push $MY_CONTAINER_REGISTRY/litellm:main-stable
-docker push $MY_CONTAINER_REGISTRY/python:3.11-slim
-
-# NOTE: vllm-openai:latest is a large image (~8-10 GB). This push will take a while.
+# Verify connection
+python3 -c "
+from clearml import Task
+t = Task.init(project_name='_connection_test', task_name='verify_access')
+print('Tenant connected. Project ID:', t.project)
+t.close()
+print('SUCCESS')
+"
 ```
 
-If you can't use Docker directly, ask your platform team how they onboard new images. There's always a process — they got ClearML's images in somehow.
-
-**🔍 VERIFY:** Write down the image names you'll use in later steps:
 ```
-MY_VLLM_IMAGE=              # e.g. "artifactory.corp.com/docker/vllm-openai:latest" or "vllm/vllm-openai:latest"
-MY_LITELLM_IMAGE=           # e.g. "artifactory.corp.com/docker/litellm:main-stable" or "ghcr.io/berriai/litellm:main-stable"
-MY_PYTHON_IMAGE=            # e.g. "artifactory.corp.com/docker/python:3.11-slim" or "python:3.11-slim"
+MY_CLEARML_API=             # API server URL
+MY_CLEARML_WEB=             # Web UI URL
+MY_CLEARML_FILES=           # File server URL
 ```
 
-### 0.8 — Set up your deployment namespace
-
-This is where all your LLM serving components will live. You have two choices:
-
-```bash
-# Option A: Deploy in the SAME namespace as ClearML
-# Pros: vLLM can reach ClearML services by short name (e.g. "clearml-api:8008")
-# Cons: Your pods mix with ClearML pods, harder to clean up
-MY_NAMESPACE=$MY_CLEARML_NAMESPACE
-
-# Option B: Deploy in a DEDICATED namespace (recommended for production)
-# Pros: Clean separation, easier RBAC, easier to tear down
-# Cons: Need full DNS names for cross-namespace communication
-MY_NAMESPACE="llm-serving"
-```
-
-#### If creating a new namespace:
-
-```bash
-# Check it doesn't already exist
-kubectl get namespace $MY_NAMESPACE 2>/dev/null && echo "ALREADY EXISTS" || echo "OK to create"
-
-# Create it
-kubectl create namespace $MY_NAMESPACE
-
-# If your cluster requires an image pull secret, copy it to the new namespace
-# (pods can only use secrets in their own namespace)
-kubectl get secret $MY_IMAGE_PULL_SECRET -n $MY_CLEARML_NAMESPACE -o yaml \
-  | sed "s/namespace: .*/namespace: $MY_NAMESPACE/" \
-  | kubectl apply -f -
-
-# Verify the namespace is active
-kubectl get namespace $MY_NAMESPACE
-# STATUS should be "Active"
-```
-
-#### If your cluster uses ResourceQuotas or LimitRanges:
-
-```bash
-# Check if there are quotas that might block your deployment
-kubectl get resourcequota -n $MY_NAMESPACE
-kubectl get limitrange -n $MY_NAMESPACE
-
-# If quotas exist, verify they allow GPU requests:
-kubectl describe resourcequota -n $MY_NAMESPACE | grep -i gpu
-# If "nvidia.com/gpu" has a limit, make sure it's >= MY_TENSOR_PARALLEL_SIZE
-# If it's too low, ask the cluster admin to increase it for your namespace
-```
-
-**🔍 VERIFY:** Write down:
-```
-MY_NAMESPACE=               # where you'll deploy everything
-```
-
-### 0.9 — Summary checklist
-
-Before proceeding, confirm you have ALL of these:
+### 0.11 — Summary checklist
 
 ```
-[ ] MY_GPU_TYPE             = ___________
-[ ] MY_GPU_MEMORY_GB        = ___________
-[ ] MY_TENSOR_PARALLEL_SIZE = ___________
-[ ] MY_CLEARML_NAMESPACE    = ___________
-[ ] MY_CLEARML_API_URL      = ___________
-[ ] MY_NAMESPACE            = ___________
-[ ] MY_STORAGE_CLASS        = ___________
-[ ] MY_FREE_GPUS            = ___________ (must be >= MY_TENSOR_PARALLEL_SIZE)
-[ ] MY_CLUSTER_HAS_INTERNET = ___________
-[ ] MY_CONTAINER_REGISTRY   = ___________ (or "docker.io" if public internet)
-[ ] MY_IMAGE_PULL_SECRET    = ___________ (or "none")
-[ ] MY_VLLM_IMAGE           = ___________ (full image path for vLLM)
-[ ] MY_LITELLM_IMAGE        = ___________ (full image path for LiteLLM)
-[ ] MY_PYTHON_IMAGE         = ___________ (full image path for python:3.11-slim)
-[ ] Hugging Face token OR Meta direct download URL OR ungated model chosen OR weights pre-staged
-[ ] ClearML access key and secret key
+[ ] MY_GPU_TYPE               = ___________
+[ ] MY_GPU_MEMORY_GB          = ___________
+[ ] MY_TENSOR_PARALLEL_SIZE   = ___________
+[ ] MY_MIG_NODES              = ___________ (will AVOID these)
+[ ] MY_FULL_GPU_NODES         = ___________ (will TARGET these)
+[ ] MY_FREE_GPUS              = ___________ (>= TENSOR_PARALLEL_SIZE)
+[ ] MY_GPU_TAINT_KEY          = ___________
+[ ] MY_GPU_NODE_LABEL         = ___________ (label distinguishing full-GPU from MIG nodes)
+[ ] MY_STORAGE_CLASS          = ___________
+[ ] MY_PULL_SECRET_NAME       = ___________
+[ ] MY_CLEARML_API            = ___________
+[ ] MY_CLEARML_WEB            = ___________
+[ ] MY_CLEARML_FILES          = ___________
+[ ] Platform team response: model ingestion path = ___________
+[ ] Platform team response: HF token / model source = ___________
+[ ] Platform team response: long-running workload policy = ___________
 ```
 
-**If any item is blank, STOP and fill it in before continuing.**
-
-> **How vLLM gets onto the cluster:** vLLM is not a system package you install
-> on nodes. It's a container image (`vllm/vllm-openai`) that Kubernetes pulls
-> and runs as a pod — just like ClearML, LiteLLM, and every other component.
-> If the cluster has internet, Kubernetes pulls it from Docker Hub automatically.
-> If the cluster is air-gapped, you pre-load it into your internal registry
-> (Step 0.7b) and reference that registry in your Deployment YAML.
+**If any critical item is blank, STOP.**
 
 ---
 
-## Step 1 — Create the Hugging Face secret
+## Step 1 — Prepare the deployment namespace
+
+You need a Kubernetes namespace where vLLM, LiteLLM, and model storage will live.
+This may already exist (your ClearML tenant's workload namespace) or you may
+need to create one.
 
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm your HF token works and has access to the gated model
-pip install huggingface_hub
-python3 -c "
-from huggingface_hub import HfApi
-api = HfApi()
-api.model_info('meta-llama/Llama-3.3-70B-Instruct', token='YOUR_TOKEN_HERE')
-print('SUCCESS: Token has access to Llama 3.3 70B')
-"
-# If you see "401" or "403": your token doesn't have access.
-# Go to https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct and accept the license.
+# Check if your tenant already has a workload namespace
+kubectl get namespaces | grep -i "clearml\|tenant\|llm\|mlops\|gpu"
+
+# Check if any of those namespaces already have a ClearML agent
+kubectl get pods -n <CANDIDATE_NAMESPACE> | grep -i agent
+
+# If a namespace already has a ClearML agent configured for your tenant,
+# that's your workload namespace. Use it.
+#
+# If no suitable namespace exists, create one.
 ```
 
-### Execute
+### Execute (only if creating a new namespace)
 
 ```bash
-# Check if the secret already exists (don't create duplicates)
-kubectl get secret hf-credentials -n $MY_NAMESPACE 2>/dev/null && echo "SECRET ALREADY EXISTS" || echo "OK to create"
+MY_NAMESPACE="llm-serving"   # choose a name
 
-# Create it
-kubectl create secret generic hf-credentials \
-  --from-literal=token=YOUR_HF_TOKEN_HERE \
-  -n $MY_NAMESPACE
+# Check it doesn't already exist
+kubectl get namespace $MY_NAMESPACE 2>/dev/null && echo "ALREADY EXISTS" || echo "OK to create"
 
-# Verify it was created
-kubectl get secret hf-credentials -n $MY_NAMESPACE
+# Create
+kubectl create namespace $MY_NAMESPACE
+
+# Copy the image pull secret into your namespace
+# (pods can only use secrets from their own namespace)
+kubectl get secret $MY_PULL_SECRET_NAME -n $MY_PULL_SECRET_NAMESPACE -o yaml \
+  | grep -v "namespace:" \
+  | grep -v "uid:" \
+  | grep -v "resourceVersion:" \
+  | grep -v "creationTimestamp:" \
+  | kubectl apply -n $MY_NAMESPACE -f -
+
+# Verify the pull secret exists in your namespace
+kubectl get secret $MY_PULL_SECRET_NAME -n $MY_NAMESPACE
+```
+
+### 🔍 VERIFY AFTER
+
+```bash
+kubectl get namespace $MY_NAMESPACE
+# STATUS must be "Active"
+
+kubectl get secret $MY_PULL_SECRET_NAME -n $MY_NAMESPACE
+# Must exist
+```
+
+```
+MY_NAMESPACE=               # your final working namespace
 ```
 
 ---
@@ -346,161 +314,173 @@ kubectl get secret hf-credentials -n $MY_NAMESPACE
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm your storage class exists and supports the access mode
+# Confirm your storage class exists
 kubectl get storageclass $MY_STORAGE_CLASS
-# Look at PROVISIONER column — this tells you what backend it uses
+# Must return a row (not "NotFound")
 
-# Check if someone already created this PVC (maybe from a previous attempt)
-kubectl get pvc llama-model-storage -n $MY_NAMESPACE 2>/dev/null && echo "PVC ALREADY EXISTS — skip this step" || echo "OK to create"
+# Check if a PVC for model storage already exists
+kubectl get pvc -n $MY_NAMESPACE | grep -i "model\|llm\|llama"
+# If it exists and is Bound with enough capacity, skip this step
 ```
 
 ### Execute
 
-Create the file `model-storage-pvc.yaml` — **substitute YOUR values:**
+Create `model-storage-pvc.yaml` — **replace placeholders:**
 
 ```yaml
 # model-storage-pvc.yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: llama-model-storage
-  namespace: MY_NAMESPACE              # <-- REPLACE with your namespace
+  name: llm-model-storage
+  namespace: <MY_NAMESPACE>            # <-- REPLACE
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
       storage: 300Gi
-  storageClassName: MY_STORAGE_CLASS   # <-- REPLACE with your storage class
+  storageClassName: <MY_STORAGE_CLASS>  # <-- REPLACE
 ```
 
 ```bash
-# Before applying, confirm the YAML has your actual values (not placeholders)
-cat model-storage-pvc.yaml | grep -E "namespace:|storageClassName:"
-# You should see YOUR values, not "MY_NAMESPACE" or "MY_STORAGE_CLASS"
+# Verify no placeholders remain
+grep "<" model-storage-pvc.yaml && echo "ERROR: Replace placeholders!" || echo "OK"
 
 kubectl apply -f model-storage-pvc.yaml
+```
 
-# Wait for it to bind
-kubectl get pvc llama-model-storage -n $MY_NAMESPACE -w
-# Expected: STATUS = "Bound"
-# If stuck on "Pending" for >2 minutes:
-kubectl describe pvc llama-model-storage -n $MY_NAMESPACE | tail -10
+### 🔍 VERIFY AFTER
+
+```bash
+kubectl get pvc llm-model-storage -n $MY_NAMESPACE
+# STATUS must be "Bound"
+# If "Pending" after 2 minutes:
+kubectl describe pvc llm-model-storage -n $MY_NAMESPACE | tail -10
 ```
 
 ---
 
-## Step 3 — Download Llama 3.3 70B weights
+## Step 3 — Stage model weights (air-gapped cluster)
+
+Since pods cannot reach the internet, model weights must be staged from
+outside the cluster. The exact method depends on what the platform team
+told you. Below are the common patterns.
 
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm the PVC is bound
-kubectl get pvc llama-model-storage -n $MY_NAMESPACE -o jsonpath='{.status.phase}'
-# Must show: "Bound"
-# If not "Bound": STOP. Fix the PVC issue from Step 2 first.
-
-# Confirm the HF secret exists
-kubectl get secret hf-credentials -n $MY_NAMESPACE -o jsonpath='{.data.token}' | base64 -d | head -c 10
-# Should show the first 10 chars of your token (e.g. "hf_xxxxxx")
+# Confirm you know the ingestion path (from platform team answer)
+# Options:
+# A) Bastion host / jump box with NFS mount to Powerscale
+# B) S3-compatible object store that Powerscale can read
+# C) Direct NFS mount accessible from your workstation
+# D) Kubectl cp into a running pod (slow for 140 GB but works)
 ```
 
-### Execute
+### Option A — Bastion host with NFS mount (most common in enterprise)
 
-Create `download-job.yaml` — **substitute YOUR namespace:**
-
-```yaml
-# download-job.yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: llama-download
-  namespace: MY_NAMESPACE              # <-- REPLACE
-spec:
-  backoffLimit: 3
-  template:
-    spec:
-      restartPolicy: Never
-      # Uncomment if your cluster requires an image pull secret:
-      # imagePullSecrets:
-      #   - name: MY_IMAGE_PULL_SECRET  # <-- REPLACE
-      containers:
-        - name: downloader
-          image: MY_PYTHON_IMAGE         # <-- REPLACE (e.g. "python:3.11-slim" or internal registry path)
-          command:
-            - /bin/sh
-            - -c
-            - |
-              pip install -q huggingface_hub && \
-              python3 -c "
-              from huggingface_hub import snapshot_download
-              import os
-              print(f'Starting download to /models/llama-3.3-70b')
-              print(f'This will download ~140 GB. Be patient.')
-              snapshot_download(
-                  repo_id='meta-llama/Llama-3.3-70B-Instruct',
-                  local_dir='/models/llama-3.3-70b',
-                  token=os.environ['HF_TOKEN'],
-                  ignore_patterns=['*.gguf', '*.bin'],
-              )
-              print('Download complete')
-              "
-          env:
-            - name: HF_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hf-credentials
-                  key: token
-          volumeMounts:
-            - name: model-storage
-              mountPath: /models
-          resources:
-            requests:
-              memory: "8Gi"
-              cpu: "2"
-      volumes:
-        - name: model-storage
-          persistentVolumeClaim:
-            claimName: llama-model-storage
-```
+From the bastion host that has both internet access AND NFS access:
 
 ```bash
-# Confirm no placeholder values remain
-grep "MY_NAMESPACE" download-job.yaml && echo "ERROR: Replace MY_NAMESPACE!" || echo "OK"
+# On the bastion host:
 
-kubectl apply -f download-job.yaml
+# 1. Install huggingface_hub
+pip install huggingface_hub
 
-# Watch progress — this takes 30-60 minutes
-kubectl logs -f job/llama-download -n $MY_NAMESPACE
+# 2. Log in (if using a gated model like Llama)
+huggingface-cli login
+# Paste your token
 
-# If it fails and you need to retry:
-# kubectl delete job llama-download -n $MY_NAMESPACE
-# kubectl apply -f download-job.yaml
-# (huggingface_hub resumes partial downloads automatically)
+# 3. Download to the NFS mount point
+#    Ask the platform team for the exact mount path
+#    e.g. /mnt/powerscale/llm-models/ or /nfs/shared/models/
+huggingface-cli download \
+  meta-llama/Llama-3.3-70B-Instruct \
+  --local-dir /mnt/powerscale/llm-models/llama-3.3-70b \
+  --exclude "*.gguf" "*.bin"
+
+# This downloads ~140 GB. Takes 30-60 minutes.
+# If using an ungated model (no HF account needed):
+#   huggingface-cli download Qwen/Qwen2.5-72B-Instruct \
+#     --local-dir /mnt/powerscale/llm-models/qwen2.5-72b
 ```
 
-### 🔍 VERIFY AFTER COMPLETION
+### Option B — Meta direct download (no HF account)
 
 ```bash
-# Confirm the download finished
-kubectl get job llama-download -n $MY_NAMESPACE -o jsonpath='{.status.succeeded}'
-# Must show: "1"
+# On a machine with internet access:
+# 1. Go to https://llama.meta.com/llama-downloads/
+# 2. Accept the license, receive a signed URL via email
+# 3. Run Meta's download script:
+./download.sh
+# 4. Transfer the downloaded directory to the NFS mount
+```
 
-# Verify the model files exist on the PV
-kubectl run verify-download --rm -it --restart=Never \
+### Option C — Kubectl cp fallback (slow but always works)
+
+If you have no bastion host but can download to your local machine:
+
+```bash
+# On your local machine (with internet):
+huggingface-cli download meta-llama/Llama-3.3-70B-Instruct \
+  --local-dir ./llama-3.3-70b \
+  --exclude "*.gguf" "*.bin"
+
+# Start a temporary pod that mounts the PVC
+kubectl run model-loader --restart=Never \
+  --image=busybox \
+  --overrides='{
+    "spec": {
+      "containers": [{
+        "name": "loader",
+        "image": "busybox",
+        "command": ["sleep", "86400"],
+        "volumeMounts": [{"name":"ms","mountPath":"/models"}]
+      }],
+      "volumes": [{"name":"ms","persistentVolumeClaim":{"claimName":"llm-model-storage"}}]
+    }
+  }' \
+  -n $MY_NAMESPACE
+
+# Wait for the pod to be Running
+kubectl get pod model-loader -n $MY_NAMESPACE -w
+
+# Copy weights into the PVC (this will be SLOW for 140 GB)
+kubectl cp ./llama-3.3-70b $MY_NAMESPACE/model-loader:/models/llama-3.3-70b
+
+# When done, delete the loader pod
+kubectl delete pod model-loader -n $MY_NAMESPACE
+```
+
+### 🔍 VERIFY AFTER (regardless of which option you used)
+
+```bash
+# Verify the model files are on the PVC
+kubectl run verify-weights --rm -it --restart=Never \
+  --image=busybox \
   --overrides='{
     "spec": {
       "containers": [{
         "name": "verify",
         "image": "busybox",
-        "command": ["sh", "-c", "ls -lh /models/llama-3.3-70b/ && du -sh /models/llama-3.3-70b/"],
+        "command": ["sh", "-c", "ls -lh /models/ && echo --- && ls /models/llama-3.3-70b/ | head -20 && echo --- && du -sh /models/llama-3.3-70b/"],
         "volumeMounts": [{"name":"ms","mountPath":"/models"}]
       }],
-      "volumes": [{"name":"ms","persistentVolumeClaim":{"claimName":"llama-model-storage"}}]
+      "volumes": [{"name":"ms","persistentVolumeClaim":{"claimName":"llm-model-storage"}}]
     }
   }' \
-  --image=busybox -n $MY_NAMESPACE
-# Expected: files totaling ~140 GB, including *.safetensors files
+  -n $MY_NAMESPACE
+
+# Expected output:
+# - A directory listing showing *.safetensors files
+# - Total size ~140 GB
+# If you see less than 100 GB or no safetensors files: download is incomplete
+```
+
+```
+MY_MODEL_PATH=              # path inside the PVC, e.g. "/models/llama-3.3-70b"
+MY_MODEL_NAME=              # what you'll name it in vLLM, e.g. "llama-3.3-70b-instruct"
 ```
 
 ---
@@ -510,51 +490,46 @@ kubectl run verify-download --rm -it --restart=Never \
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm ClearML is reachable from your local machine
-python3 -c "
-from clearml import Task
-print('ClearML SDK version:', Task.__version__)
-print('Connection test...')
-t = Task.init(project_name='_test', task_name='_connection_test', reuse_last_task_id=True)
-t.close()
-print('SUCCESS: ClearML is reachable')
-"
-# If this fails: run 'clearml-init' and enter your cluster ClearML credentials
+# Confirm ClearML CLI is configured and working
+python3 -c "from clearml import Task; print('ClearML SDK OK')"
 ```
 
 ### Execute
 
-Create `register_model.py`:
+Create `register_model.py` — **update the values in the config section:**
 
 ```python
 # register_model.py
 from clearml import Task, OutputModel
 
-# Update these if your GPU type is different
-GPU_TYPE = "H200 (141 GB HBM3e)"   # <-- CHANGE if using H100s
-MIN_GPUS = 2                        # <-- CHANGE if using H100s (set to 4)
+# ============================================================
+# CONFIGURE THESE
+# ============================================================
+PROJECT_NAME     = "production-llm"
+MODEL_NAME       = "llama-3.3-70b-instruct"       # <-- match MY_MODEL_NAME
+CLUSTER_PATH     = "/models/llama-3.3-70b"         # <-- match MY_MODEL_PATH
+GPU_TYPE         = "H200 (141 GB HBM3e)"           # <-- or "H100 (80 GB HBM3)"
+MIN_GPUS         = 2                                # <-- match MY_TENSOR_PARALLEL_SIZE
+# ============================================================
 
 task = Task.init(
-    project_name="production-llm",
-    task_name="register-llama-3.3-70b",
+    project_name=PROJECT_NAME,
+    task_name=f"register-{MODEL_NAME}",
     task_type=Task.TaskTypes.data_processing,
     reuse_last_task_id=False,
 )
 
 out_model = OutputModel(
     task=task,
-    name="llama-3.3-70b-instruct",
-    tags=["llama3", "70b", "instruct", "vllm", "production"],
+    name=MODEL_NAME,
+    tags=["70b", "instruct", "vllm", "production"],
     framework="PyTorch",
 )
 
 out_model.update_design(config_dict={
-    "model_id": "meta-llama/Llama-3.3-70B-Instruct",
-    "cluster_path": "/models/llama-3.3-70b",
+    "cluster_path": CLUSTER_PATH,
     "format": "safetensors",
     "precision": "bfloat16",
-    "context_length": 131072,
-    "param_count": "70B",
     "inference_engine": "vLLM",
     "gpu_type": GPU_TYPE,
     "min_gpus": MIN_GPUS,
@@ -562,82 +537,89 @@ out_model.update_design(config_dict={
 })
 
 task.close()
-print(f"Model registered. ID: {out_model.id}")
+print(f"Model registered: {out_model.id}")
 ```
 
 ```bash
 python3 register_model.py
 ```
 
-### 🔍 VERIFY AFTER COMPLETION
+### 🔍 VERIFY AFTER
 
-Open ClearML web UI → Models → search for `llama-3.3-70b-instruct`. Confirm it appears with the correct metadata.
+Open ClearML Web UI → Models → search for your model name. Confirm it appears
+with correct metadata (path, GPU type, minimum GPUs).
 
 ---
 
 ## Step 5 — Deploy vLLM inference server
 
+vLLM runs as a container image (`vllm/vllm-openai`) inside a Kubernetes pod.
+You do NOT install vLLM on the cluster nodes — Kubernetes pulls the image and
+runs it. The managed pull secrets handle Docker Hub authentication.
+
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm enough GPUs are free for your tensor-parallel-size
-echo "Need $MY_TENSOR_PARALLEL_SIZE GPUs. Checking availability..."
-kubectl describe nodes | grep -A5 "nvidia.com/gpu"
-# "Allocatable" minus "Allocated" must be >= MY_TENSOR_PARALLEL_SIZE
+# 1. Confirm enough free GPUs on non-MIG nodes
+for node in <MY_FULL_GPU_NODES>; do
+  echo "--- $node ---"
+  kubectl describe node $node | grep -A5 "Allocated resources" | grep nvidia
+done
+# Free GPUs must be >= MY_TENSOR_PARALLEL_SIZE
 
-# Confirm the model weights PVC is bound
-kubectl get pvc llama-model-storage -n $MY_NAMESPACE -o jsonpath='{.status.phase}'
+# 2. Confirm model weights PVC is Bound
+kubectl get pvc llm-model-storage -n $MY_NAMESPACE -o jsonpath='{.status.phase}'
 # Must show: "Bound"
 
-# Confirm the vLLM image is pullable (test on a non-GPU node)
-kubectl run test-pull --rm -it --restart=Never --image=vllm/vllm-openai:latest -- echo "Image pulled OK" 2>/dev/null
-# If this hangs: the cluster can't reach Docker Hub. You need to pre-load the image.
+# 3. Confirm pull secret exists in your namespace
+kubectl get secret $MY_PULL_SECRET_NAME -n $MY_NAMESPACE
+# Must exist
 
-# Confirm the GPU toleration matches your cluster's taint
-kubectl describe nodes | grep -i taint
-# Note the exact taint key (e.g. "nvidia.com/gpu", "gpu=true", or no taint at all)
-# If your cluster uses a DIFFERENT taint key, change the toleration in the YAML below
-```
-
-```
-MY_GPU_TAINT_KEY=           # e.g. "nvidia.com/gpu" (default) or whatever your cluster uses
+# 4. (Optional) Confirm the vLLM image is pullable
+kubectl run test-vllm-pull --rm -it --restart=Never \
+  --overrides="{\"spec\":{\"imagePullSecrets\":[{\"name\":\"$MY_PULL_SECRET_NAME\"}]}}" \
+  --image=vllm/vllm-openai:latest -- echo "Image pull OK"
+# If this fails: the managed credentials may not include Docker Hub,
+# or the image name has changed. Check with platform team.
 ```
 
 ### Execute
 
-Create `vllm-deployment.yaml` — **substitute YOUR values in the marked lines:**
+Create `vllm-deployment.yaml` — **replace ALL placeholders marked with `<>`:**
 
 ```yaml
 # vllm-deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm-llama-70b
-  namespace: MY_NAMESPACE                # <-- REPLACE
+  name: vllm-inference
+  namespace: <MY_NAMESPACE>                       # <-- REPLACE
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: vllm-llama-70b
+      app: vllm-inference
   template:
     metadata:
       labels:
-        app: vllm-llama-70b
+        app: vllm-inference
     spec:
-      # Uncomment if your cluster requires an image pull secret:
-      # imagePullSecrets:
-      #   - name: MY_IMAGE_PULL_SECRET  # <-- REPLACE
+      imagePullSecrets:
+        - name: <MY_PULL_SECRET_NAME>              # <-- REPLACE (remove block if not needed)
+      nodeSelector:
+        gpu-mode: full                             # <-- targets non-MIG nodes (from Step 0.4)
+                                                   #     change key/value to match YOUR label
       containers:
         - name: vllm
-          image: MY_VLLM_IMAGE           # <-- REPLACE (e.g. "vllm/vllm-openai:latest" or internal registry path)
+          image: vllm/vllm-openai:latest
           command:
             - python3
             - -m
             - vllm.entrypoints.openai.api_server
           args:
-            - --model=/models/llama-3.3-70b
-            - --served-model-name=llama-3.3-70b-instruct
-            - --tensor-parallel-size=MY_TENSOR_PARALLEL_SIZE   # <-- REPLACE (2 for H200, 4 for H100)
+            - --model=<MY_MODEL_PATH>              # <-- REPLACE (e.g. /models/llama-3.3-70b)
+            - --served-model-name=<MY_MODEL_NAME>  # <-- REPLACE (e.g. llama-3.3-70b-instruct)
+            - --tensor-parallel-size=<MY_TENSOR_PARALLEL_SIZE>  # <-- REPLACE (2 or 4)
             - --dtype=bfloat16
             - --max-model-len=32768
             - --gpu-memory-utilization=0.90
@@ -647,17 +629,11 @@ spec:
             - --enable-chunked-prefill
           ports:
             - containerPort: 8000
-          env:
-            - name: HUGGING_FACE_HUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hf-credentials
-                  key: token
           resources:
             limits:
-              nvidia.com/gpu: "MY_TENSOR_PARALLEL_SIZE"       # <-- REPLACE (must match above)
+              nvidia.com/gpu: "<MY_TENSOR_PARALLEL_SIZE>"   # <-- REPLACE (must match above)
             requests:
-              nvidia.com/gpu: "MY_TENSOR_PARALLEL_SIZE"       # <-- REPLACE (must match above)
+              nvidia.com/gpu: "<MY_TENSOR_PARALLEL_SIZE>"   # <-- REPLACE
               memory: "64Gi"
               cpu: "8"
           volumeMounts:
@@ -684,77 +660,88 @@ spec:
       volumes:
         - name: model-storage
           persistentVolumeClaim:
-            claimName: llama-model-storage
+            claimName: llm-model-storage
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: "16Gi"
       tolerations:
-        - key: MY_GPU_TAINT_KEY             # <-- REPLACE (e.g. "nvidia.com/gpu")
+        - key: <MY_GPU_TAINT_KEY>                  # <-- REPLACE (or remove block if no taints)
           operator: Exists
           effect: NoSchedule
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-llama-70b
-  namespace: MY_NAMESPACE                  # <-- REPLACE
+  name: vllm-inference
+  namespace: <MY_NAMESPACE>                        # <-- REPLACE
 spec:
   selector:
-    app: vllm-llama-70b
+    app: vllm-inference
   ports:
     - port: 8000
       targetPort: 8000
   type: ClusterIP
 ```
 
+**Key elements explained:**
+- `nodeSelector: gpu-mode: full` — ensures the pod lands on non-MIG nodes. Change to match your label from Step 0.4.
+- `/dev/shm` volume — required for NCCL multi-GPU communication. Without it, tensor parallelism crashes.
+- `--gpu-memory-utilization=0.90` — uses 90% of each GPU's 141 GB for weights + KV cache.
+- `readinessProbe` at 180s — vLLM takes 3-5 minutes to load 140 GB of weights. Don't let K8s kill it early.
+- `livenessProbe` at 300s — even longer grace period to prevent restarts during loading.
+
 ```bash
-# Final check: no placeholder values remain
-grep -n "MY_" vllm-deployment.yaml
-# If ANY lines show "MY_" prefixes: STOP and replace them with your actual values
+# Verify no placeholders remain
+grep "<" vllm-deployment.yaml && echo "ERROR: Replace all <> placeholders!" || echo "OK"
 
 kubectl apply -f vllm-deployment.yaml
 
-# Watch the pod start (3-5 minutes to load 140 GB of weights)
-kubectl get pods -n $MY_NAMESPACE -l app=vllm-llama-70b -w
+# Watch the pod start (3-5 minutes for weight loading)
+kubectl get pods -n $MY_NAMESPACE -l app=vllm-inference -w
 
 # Follow logs to see loading progress
-kubectl logs -f deployment/vllm-llama-70b -n $MY_NAMESPACE
+kubectl logs -f deployment/vllm-inference -n $MY_NAMESPACE
 # Wait for: "INFO:     Application startup complete."
 ```
 
-### 🔍 VERIFY AFTER DEPLOYMENT
+### 🔍 VERIFY AFTER
 
 ```bash
-# Check pod is Running (not CrashLoopBackOff or Pending)
-kubectl get pods -n $MY_NAMESPACE -l app=vllm-llama-70b
-# STATUS must be "Running" and READY must be "1/1"
+# Pod status
+kubectl get pods -n $MY_NAMESPACE -l app=vllm-inference
+# STATUS=Running, READY=1/1
 
-# If STATUS is "Pending": check why
-kubectl describe pod -l app=vllm-llama-70b -n $MY_NAMESPACE | grep -A5 "Events"
-# Common causes: not enough GPUs, PVC can't mount, image can't pull
+# If Pending: check why
+kubectl describe pod -l app=vllm-inference -n $MY_NAMESPACE | grep -A10 "Events"
+# Common: not enough GPUs, nodeSelector doesn't match, taint not tolerated
 
-# If STATUS is "CrashLoopBackOff": check logs
-kubectl logs -l app=vllm-llama-70b -n $MY_NAMESPACE --tail=50
+# If CrashLoopBackOff: check logs
+kubectl logs -l app=vllm-inference -n $MY_NAMESPACE --tail=50
 
 # Health check
-kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- curl -s http://localhost:8000/health
+kubectl exec deployment/vllm-inference -n $MY_NAMESPACE -- \
+  curl -s http://localhost:8000/health
 # Expected: {"status":"ok"}
 
-# Verify GPU usage
-kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- nvidia-smi
-# Expected: 2+ GPUs showing ~90% memory used, model name in process list
+# GPU usage check
+kubectl exec deployment/vllm-inference -n $MY_NAMESPACE -- nvidia-smi
+# Expected: 2+ GPUs showing ~90% memory used
+
+# Confirm it landed on a non-MIG node
+kubectl get pod -l app=vllm-inference -n $MY_NAMESPACE -o wide
+# NODE column should show one of MY_FULL_GPU_NODES, NOT a MIG node
 
 # Test inference
-kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- \
+kubectl exec deployment/vllm-inference -n $MY_NAMESPACE -- \
   curl -s -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"llama-3.3-70b-instruct","messages":[{"role":"user","content":"Hello, what model are you?"}],"max_tokens":50}'
-# Expected: a coherent response identifying itself as Llama
+  -d '{"model":"<MY_MODEL_NAME>","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
+# Expected: a coherent response from the LLM
 
-# Check the service is reachable by name
+# Test service DNS
 kubectl run test-svc --rm -it --restart=Never --image=busybox -n $MY_NAMESPACE -- \
-  wget -qO- http://vllm-llama-70b:8000/health --timeout=10
+  wget -qO- http://vllm-inference:8000/health --timeout=10
 # Expected: {"status":"ok"}
 ```
 
@@ -765,24 +752,24 @@ kubectl run test-svc --rm -it --restart=Never --image=busybox -n $MY_NAMESPACE -
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm vLLM service is responding
+# Confirm vLLM service is healthy
 kubectl run test-vllm --rm -it --restart=Never --image=busybox -n $MY_NAMESPACE -- \
-  wget -qO- http://vllm-llama-70b:8000/health --timeout=10
+  wget -qO- http://vllm-inference:8000/health --timeout=10
 # Must show: {"status":"ok"}
-# If not: STOP. Fix vLLM deployment in Step 5 first.
+# If not: STOP. Fix Step 5 first.
 ```
 
 ### Execute
 
-Create `litellm-config.yaml`:
+Create `litellm-config.yaml` — **replace placeholders:**
 
 ```yaml
 # litellm-config.yaml
 model_list:
-  - model_name: llama-3.3-70b-instruct
+  - model_name: <MY_MODEL_NAME>                                                    # <-- REPLACE
     litellm_params:
-      model: openai/llama-3.3-70b-instruct
-      api_base: http://vllm-llama-70b.MY_NAMESPACE.svc.cluster.local:8000/v1   # <-- REPLACE MY_NAMESPACE
+      model: openai/<MY_MODEL_NAME>                                                # <-- REPLACE
+      api_base: http://vllm-inference.<MY_NAMESPACE>.svc.cluster.local:8000/v1     # <-- REPLACE namespace
       api_key: "not-used"
 
 litellm_settings:
@@ -790,24 +777,17 @@ litellm_settings:
   request_timeout: 300
 
 general_settings:
-  master_key: "sk-CHANGE-THIS-TO-A-REAL-KEY"    # <-- CHANGE THIS
+  master_key: "<GENERATE_A_RANDOM_KEY>"       # <-- REPLACE (e.g. sk-xxxxxxxxxxxx)
 ```
 
 ```bash
-# Verify no placeholders remain
-grep "MY_NAMESPACE\|CHANGE-THIS" litellm-config.yaml
-# MY_NAMESPACE should be gone. "CHANGE-THIS" is OK if you've set a real key.
-
 # Create ConfigMap
 kubectl create configmap litellm-config \
   --from-file=config.yaml=litellm-config.yaml \
   -n $MY_NAMESPACE
-
-# Verify
-kubectl get configmap litellm-config -n $MY_NAMESPACE
 ```
 
-Create `litellm-deployment.yaml`:
+Create `litellm-deployment.yaml` — **replace placeholders:**
 
 ```yaml
 # litellm-deployment.yaml
@@ -815,7 +795,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: litellm-proxy
-  namespace: MY_NAMESPACE            # <-- REPLACE
+  namespace: <MY_NAMESPACE>             # <-- REPLACE
 spec:
   replicas: 1
   selector:
@@ -826,12 +806,11 @@ spec:
       labels:
         app: litellm-proxy
     spec:
-      # Uncomment if your cluster requires an image pull secret:
-      # imagePullSecrets:
-      #   - name: MY_IMAGE_PULL_SECRET  # <-- REPLACE
+      imagePullSecrets:
+        - name: <MY_PULL_SECRET_NAME>    # <-- REPLACE (remove block if not needed)
       containers:
         - name: litellm
-          image: MY_LITELLM_IMAGE        # <-- REPLACE (e.g. "ghcr.io/berriai/litellm:main-stable" or internal registry path)
+          image: ghcr.io/berriai/litellm:main-stable
           args:
             - --config=/app/config.yaml
             - --port=4000
@@ -860,54 +839,46 @@ apiVersion: v1
 kind: Service
 metadata:
   name: litellm-proxy
-  namespace: MY_NAMESPACE            # <-- REPLACE
+  namespace: <MY_NAMESPACE>              # <-- REPLACE
 spec:
   selector:
     app: litellm-proxy
   ports:
     - port: 4000
       targetPort: 4000
-  type: NodePort                     # Change to LoadBalancer if your cluster supports it
+  type: NodePort
 ```
 
 ```bash
 # Verify no placeholders
-grep -n "MY_" litellm-deployment.yaml && echo "ERROR: Replace placeholders!" || echo "OK"
+grep "<" litellm-deployment.yaml && echo "ERROR: Replace placeholders!" || echo "OK"
 
 kubectl apply -f litellm-deployment.yaml
-
-# Wait for pod to be ready
 kubectl get pods -n $MY_NAMESPACE -l app=litellm-proxy -w
 ```
 
-### 🔍 VERIFY AFTER DEPLOYMENT
+### 🔍 VERIFY AFTER
 
 ```bash
-# Get the access URL
-# For NodePort:
+# Get access URL
 NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 NODE_PORT=$(kubectl get svc litellm-proxy -n $MY_NAMESPACE -o jsonpath='{.spec.ports[0].nodePort}')
 echo "LiteLLM URL: http://$NODE_IP:$NODE_PORT"
 
-# For LoadBalancer:
-# LB_IP=$(kubectl get svc litellm-proxy -n $MY_NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-# echo "LiteLLM URL: http://$LB_IP:4000"
-
 # Health check
 curl -s http://$NODE_IP:$NODE_PORT/health
-# Expected: {"status":"healthy"}
 
-# Full end-to-end test: prompt → LiteLLM → vLLM → H200 GPUs → response
+# End-to-end test
 curl -s -X POST http://$NODE_IP:$NODE_PORT/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-CHANGE-THIS-TO-A-REAL-KEY" \
-  -d '{
-    "model": "llama-3.3-70b-instruct",
-    "messages": [{"role": "user", "content": "Explain tensor parallelism in one sentence."}],
-    "max_tokens": 100
-  }'
-# Expected: a coherent response about tensor parallelism
-# If you get a response: CONGRATULATIONS. The full stack is working.
+  -H "Authorization: Bearer <YOUR_MASTER_KEY>" \
+  -d "{
+    \"model\": \"<MY_MODEL_NAME>\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"What model are you?\"}],
+    \"max_tokens\": 100
+  }"
+# Expected: a coherent response from the LLM
+# If you get this: THE FULL STACK IS WORKING.
 ```
 
 ---
@@ -917,55 +888,50 @@ curl -s -X POST http://$NODE_IP:$NODE_PORT/v1/chat/completions \
 ### 🔍 VERIFY BEFORE PROCEEDING
 
 ```bash
-# Confirm ClearML credentials are configured on your local machine
-python3 -c "from clearml import Task; print('ClearML SDK OK')"
-
 # Confirm LiteLLM is reachable from your local machine
-# (use the URL from Step 6 verification)
-curl -s http://YOUR_LITELLM_URL/health
-# Must show: {"status":"healthy"}
+curl -s http://<LITELLM_URL>/health
+# Must show healthy
 ```
 
 ### Execute
 
-Create `inference_task.py` — **substitute YOUR values:**
+Create `inference_task.py` — **update the config section:**
 
 ```python
 # inference_task.py
-import os
-import json
-import urllib.request
+import os, json, urllib.request
 from clearml import Task, InputModel
 
 # ============================================================
-# CONFIGURE THESE — use the values from YOUR cluster discovery
+# CONFIGURE THESE
 # ============================================================
-LITELLM_URL = "http://NODE_IP:NODE_PORT"            # <-- REPLACE
-API_KEY     = "sk-CHANGE-THIS-TO-A-REAL-KEY"         # <-- REPLACE
+LITELLM_URL  = "http://<NODE_IP>:<NODE_PORT>"    # <-- REPLACE
+API_KEY      = "<YOUR_MASTER_KEY>"                # <-- REPLACE
+MODEL_NAME   = "<MY_MODEL_NAME>"                  # <-- REPLACE
+PROJECT_NAME = "production-llm"
 # ============================================================
 
 task = Task.init(
-    project_name="production-llm",
-    task_name="llama-3.3-70b-inference-demo",
+    project_name=PROJECT_NAME,
+    task_name=f"{MODEL_NAME}-inference-demo",
     task_type=Task.TaskTypes.inference,
     reuse_last_task_id=False,
 )
 logger = task.get_logger()
 
-# Retrieve the registered model
-model = InputModel(name="llama-3.3-70b-instruct", project="production-llm")
-logger.report_text(f"Using model: {model.name}  ID: {model.id}")
+model = InputModel(name=MODEL_NAME, project=PROJECT_NAME)
+logger.report_text(f"Model: {model.name}  ID: {model.id}")
 
 prompts = [
     "Explain transformer attention in one paragraph.",
     "What is tensor parallelism?",
-    "How does vLLM's continuous batching work?",
+    "How does continuous batching work in LLM inference?",
 ]
 
 results = []
 for i, prompt in enumerate(prompts, 1):
     payload = {
-        "model": "llama-3.3-70b-instruct",
+        "model": MODEL_NAME,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 200,
         "temperature": 0.7,
@@ -973,62 +939,57 @@ for i, prompt in enumerate(prompts, 1):
     req = urllib.request.Request(
         f"{LITELLM_URL}/v1/chat/completions",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {API_KEY}"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+        },
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         resp = json.loads(r.read())
     text = resp["choices"][0]["message"]["content"]
     usage = resp.get("usage", {})
-
     logger.report_text(f"Query {i}: {prompt}\nResponse: {text}")
     logger.report_scalar("Token usage", "prompt_tokens", usage.get("prompt_tokens", 0), i)
     logger.report_scalar("Token usage", "completion_tokens", usage.get("completion_tokens", 0), i)
-
     results.append({"prompt": prompt, "response": text, "tokens": usage})
     print(f"Query {i} done. Tokens: {usage}")
 
 task.upload_artifact("inference_results", artifact_object=results)
 task.close()
-print("Done. Check ClearML UI → production-llm → Tasks.")
+print(f"Done. Check ClearML UI -> {PROJECT_NAME} -> Tasks")
 ```
 
 ```bash
 python3 inference_task.py
 ```
 
-### 🔍 VERIFY AFTER COMPLETION
+### 🔍 VERIFY AFTER
 
-Open ClearML web UI → `production-llm` → Tasks → `llama-3.3-70b-inference-demo`.
-Confirm you see: prompts and responses in the log, token usage graphs, and the inference_results artifact.
+Open ClearML Web UI → your project → Tasks. Confirm: prompts and responses in the
+log, token usage graphs, and the inference_results artifact.
 
 ---
 
-## Step 8 — Monitor GPU health (your ClusterAdmin responsibility)
+## Step 8 — Monitor GPU health
 
 ```bash
-# Quick GPU status check
-kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- nvidia-smi
+# Quick GPU status
+kubectl exec deployment/vllm-inference -n $MY_NAMESPACE -- nvidia-smi
+# Look for:
+#   Memory: ~90% used per GPU
+#   Temperature: under 80°C
+#   Power: up to 700W (H200 SXM) under load
 
-# What to look for:
-# - Memory: ~90% used per GPU (weights + KV cache)
-# - Utilisation: spikes during inference, 0% when idle
-# - Temperature: under 80°C (H200 SXM throttles at ~83°C)
-# - Power: up to 700W per H200 SXM under load
+# DCGM diagnostics (if available)
+kubectl exec deployment/vllm-inference -n $MY_NAMESPACE -- dcgmi diag -r 1
 
-# If DCGM is installed on the cluster:
-kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- dcgmi diag -r 1
-# Level 1 = quick health check
-# Level 3 = comprehensive (takes ~2 minutes, stresses GPUs)
-
-# Real-time metrics stream:
-kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- \
+# Real-time metrics stream
+kubectl exec deployment/vllm-inference -n $MY_NAMESPACE -- \
   dcgmi dmon -e 100,101,102,203,204 -d 2000
-# 100 = SM utilisation (%)
-# 101 = memory utilisation (%)
-# 102 = memory used (MB) — should show ~126000 per GPU for 70B bf16
-# 203 = GPU temperature (°C)
-# 204 = power usage (W)
+# 100=SM util%  101=mem util%  102=mem used(MB)  203=temp(C)  204=power(W)
+
+# Check NCCL topology (multi-GPU communication path)
+kubectl logs deployment/vllm-inference -n $MY_NAMESPACE | grep -i "nccl\|nvlink\|topology"
 ```
 
 ---
@@ -1037,64 +998,63 @@ kubectl exec deployment/vllm-llama-70b -n $MY_NAMESPACE -- \
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| Pod stuck in `Pending` | Not enough free GPUs | `kubectl describe pod` to confirm. Wait for GPUs or reduce `tensor-parallel-size` |
-| Pod `CrashLoopBackOff` | OOM or bad config | Check `kubectl logs`. If OOM: reduce `--max-model-len` to 16384 or use more GPUs |
-| vLLM starts but `Killed` after 2 min | Liveness probe too aggressive | Increase `livenessProbe.initialDelaySeconds` to 600 |
+| Pod `Pending` | Not enough free GPUs, or nodeSelector doesn't match | `kubectl describe pod` → Events section |
+| Pod `Pending` + "didn't match node selector" | Label mismatch | Verify label: `kubectl get nodes --show-labels \| grep <label>` |
+| Pod `CrashLoopBackOff` | OOM or bad args | Check logs. If OOM: reduce `--max-model-len` to `16384` |
+| vLLM killed after 2 min | Liveness probe too aggressive | Increase `livenessProbe.initialDelaySeconds` to `600` |
 | NCCL shared memory error | Missing `/dev/shm` mount | Add the `shm` emptyDir volume (see Step 5 YAML) |
-| LiteLLM returns 502 | vLLM not ready yet | Wait 5 minutes. Check vLLM pod logs for "Application startup complete" |
-| "Context length exceeded" | Prompt + max_tokens > `--max-model-len` | Increase `--max-model-len` (needs more GPU memory) or shorten prompt |
-| Download job fails at 50% | Network timeout | Delete job, re-apply. `huggingface_hub` resumes automatically |
-| `nvidia-smi` shows 0% utilisation | No requests coming in | Normal when idle. Send a test request to confirm |
-| Image pull fails | Cluster can't reach Docker Hub | Use internal registry path from Step 0.7b. Verify with: `kubectl describe pod` → look for "Failed to pull image" |
-| `ImagePullBackOff` | Wrong registry URL or missing pull secret | Check `MY_CONTAINER_REGISTRY` and `MY_IMAGE_PULL_SECRET`. Run: `kubectl get events -n $MY_NAMESPACE` |
-| `ErrImagePull` with auth error | Pull secret not in your namespace | Copy secret: `kubectl get secret NAME -n SOURCE_NS -o yaml \| sed 's/namespace:.*/namespace: YOUR_NS/' \| kubectl apply -f -` |
+| Pod scheduled on MIG node | nodeSelector missing or wrong | Add/fix `nodeSelector` with your non-MIG label |
+| LiteLLM returns 502 | vLLM not ready | Wait 5 min. Check vLLM logs for "Application startup complete" |
+| Context length exceeded | Prompt too long | Increase `--max-model-len` (needs more GPU memory) |
+| `ImagePullBackOff` | Pull secret missing in namespace | Copy secret: Step 1 instructions |
+| `ErrImagePull` + auth error | Wrong secret or expired token | `kubectl describe pod` → check image name and secret |
+| nvidia-smi shows 0% util | No requests in flight | Normal when idle. Send a test request. |
 
 ---
 
-## Cleanup (when you're done)
+## Cleanup
 
 ```bash
-# Remove everything in reverse order
+# Remove in reverse order
 kubectl delete deployment litellm-proxy -n $MY_NAMESPACE
 kubectl delete svc litellm-proxy -n $MY_NAMESPACE
 kubectl delete configmap litellm-config -n $MY_NAMESPACE
-kubectl delete deployment vllm-llama-70b -n $MY_NAMESPACE
-kubectl delete svc vllm-llama-70b -n $MY_NAMESPACE
-kubectl delete job llama-download -n $MY_NAMESPACE
-kubectl delete pvc llama-model-storage -n $MY_NAMESPACE    # WARNING: deletes 140GB of downloaded weights
-kubectl delete secret hf-credentials -n $MY_NAMESPACE
+kubectl delete deployment vllm-inference -n $MY_NAMESPACE
+kubectl delete svc vllm-inference -n $MY_NAMESPACE
+kubectl delete pvc llm-model-storage -n $MY_NAMESPACE   # WARNING: deletes model weights
 ```
 
 ---
 
-## Key differences from the local lab
+## Reference: local lab → production mapping
 
-| Topic | Local lab | Production |
-| ----- | --------- | ---------- |
-| Model weights storage | Local filesystem | Kubernetes PersistentVolume |
-| Inference engine | Custom serve.py (stdlib) | vLLM (PagedAttention, continuous batching) |
-| GPU type | 1× GTX 1070 Ti (8 GB) | 2-8× H200 (141 GB HBM3e each) |
-| GPU memory total | 8 GB | 282–1,128 GB |
+| Topic | Local lab | Production (this guide) |
+|-------|-----------|------------------------|
+| Model storage | Local filesystem | Kubernetes PVC on NFS |
+| Inference engine | Custom serve.py | vLLM (PagedAttention, continuous batching) |
+| GPU | 1× consumer GPU | 2-8× H200 (141 GB HBM3e each) |
 | Context window | 128 chars | 32K–131K tokens |
-| Concurrency | 1 request at a time | Hundreds (continuous batching) |
-| LiteLLM deployment | Docker container | Kubernetes Deployment |
-| Model download | Phase 1 script | Kubernetes Job |
-| API key security | Hardcoded demo key | Kubernetes Secret |
-| Networking | localhost | Kubernetes Service DNS |
-| Multi-GPU comms | N/A (single GPU) | NCCL over NVLink (/dev/shm required) |
-| Monitoring | nvidia-smi manually | DCGM + Prometheus + Grafana |
+| Concurrency | 1 request | Hundreds (continuous batching) |
+| API gateway | Docker LiteLLM | K8s LiteLLM Deployment |
+| Model download | Python script | Air-gap staging via bastion/NFS |
+| Secrets | Hardcoded | Kubernetes Secrets |
+| Networking | localhost | K8s Service DNS |
+| Multi-GPU | N/A | NCCL over NVLink (/dev/shm) |
+| GPU targeting | N/A | nodeSelector to avoid MIG nodes |
+| Monitoring | nvidia-smi | DCGM + Prometheus |
 
-The API your clients call is identical:
+The API clients call is identical in both environments:
 `POST /v1/chat/completions` with `Authorization: Bearer <key>`.
-That is the whole point of the LiteLLM abstraction layer.
 
 ---
 
 ## Next steps
 
-1. **Add an Ingress** — DNS name + TLS in front of LiteLLM
-2. **Add virtual keys** — per-user rate limiting and spend tracking in LiteLLM
-3. **Enable vLLM metrics** — `--enable-metrics` flag, scrape with Prometheus
-4. **ClearML Pipeline** — auto-redeploy when a new model version is registered
-5. **Scale up** — try `--tensor-parallel-size=4` for full 131K context and higher concurrency
-6. **Point VS Code at it** — Configure Continue.dev or Copilot alternatives to use your LiteLLM endpoint
+1. **Add Ingress** — DNS name + TLS in front of LiteLLM
+2. **LiteLLM virtual keys** — per-user rate limiting and usage tracking
+3. **vLLM metrics** — add `--enable-metrics`, scrape with Prometheus
+4. **ClearML Pipeline** — auto-redeploy when a new model is registered
+5. **Scale up** — try higher `--tensor-parallel-size` for full 131K context
+6. **Point dev tools** — configure VS Code / Continue.dev to use the LiteLLM endpoint
+7. **ClearML queue integration** — if the platform team confirms ClearML should manage
+   the inference lifecycle, create a dedicated queue for long-running serving tasks
