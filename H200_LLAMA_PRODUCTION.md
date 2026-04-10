@@ -130,8 +130,8 @@ kubectl describe pod <CLEARML_AGENT_POD> -n <NAMESPACE> | grep -i proxy
 You should see `http_proxy`, `https_proxy`, and `no_proxy` values.
 
 ```
-MY_HTTP_PROXY=              # e.g. "http://10.x.x.x:3128/"
-MY_HTTPS_PROXY=             # e.g. "http://10.x.x.x:3128/"
+MY_HTTP_PROXY=              # e.g. "http://10.x.x.x:3xx8/"
+MY_HTTPS_PROXY=             # e.g. "http://10.x.x.x:3xx8/"
 MY_NO_PROXY=                # e.g. ".clearml.internal.com,127.0.0.1,localhost"
 ```
 
